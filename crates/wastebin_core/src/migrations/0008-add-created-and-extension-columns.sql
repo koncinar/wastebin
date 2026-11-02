@@ -1,0 +1,4 @@
+ALTER TABLE entries ADD COLUMN created_at TEXT;
+ALTER TABLE entries ADD COLUMN extension TEXT;
+ALTER TABLE entries ADD COLUMN seq INTEGER;
+

@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use crate::crypto::{self, Password};
 use crate::expiration::Expiration;
 use crate::id::Id;
-use read::{DatabaseEntry, ListEntry, Metadata};
+use read::{DatabaseEntry, ListEntry, ListPage, Metadata};
 
 /// Database related errors.
 #[derive(thiserror::Error, Debug)]
@@ -88,6 +88,11 @@ enum Command {
     },
     List {
         result: oneshot::Sender<Result<Vec<ListEntry>, Error>>,
+    },
+    ListPaginated {
+        page: usize,
+        per_page: usize,
+        result: oneshot::Sender<Result<ListPage, Error>>,
     },
     Purge {
         result: oneshot::Sender<Result<Vec<Id>, Error>>,
@@ -275,12 +280,38 @@ pub mod read {
         pub id: Id,
         /// Optional title
         pub title: Option<String>,
+        /// Optional file extension
+        pub extension: Option<String>,
+        /// Creation timestamp if recorded
+        pub created_at: Option<String>,
         /// If entry is encrypted
         pub is_encrypted: bool,
+        /// If entry is deleted after first view
+        pub burn_after_reading: bool,
         /// Expiration if set
         pub expiration: Option<String>,
         /// If entry is expired
         pub is_expired: bool,
+    }
+
+    impl ListEntry {
+        /// URL path including the optional extension.
+        #[must_use]
+        pub fn url_path(&self) -> String {
+            match self.extension.as_deref().filter(|ext| !ext.is_empty()) {
+                Some(ext) => format!("{}.{}", self.id, ext),
+                None => self.id.to_string(),
+            }
+        }
+    }
+
+    /// A page of active entries along with the total count.
+    #[derive(Debug)]
+    pub struct ListPage {
+        /// Entries on this page
+        pub entries: Vec<ListEntry>,
+        /// Total count of non-expired entries
+        pub total: usize,
     }
 
     impl DatabaseEntry {
@@ -381,6 +412,9 @@ impl Handler {
             M::up(include_str!("migrations/0005-drop-text-column.sql")),
             M::up(include_str!("migrations/0006-add-nonce-column.sql")),
             M::up(include_str!("migrations/0007-add-title-column.sql")),
+            M::up(include_str!(
+                "migrations/0008-add-created-and-extension-columns.sql"
+            )),
         ]);
 
         migrations.to_latest(&mut conn)?;
@@ -421,6 +455,13 @@ impl Handler {
                 Command::List { result } => {
                     result.send(self.list()).map_err(|_| Error::ResultSendError)
                 }
+                Command::ListPaginated {
+                    page,
+                    per_page,
+                    result,
+                } => result
+                    .send(self.list_paginated(page, per_page))
+                    .map_err(|_| Error::ResultSendError),
                 Command::Purge { result } => result
                     .send(self.purge())
                     .map_err(|_| Error::ResultSendError),
@@ -438,6 +479,7 @@ impl Handler {
     ) -> Result<(Id, write::Entry), Error> {
         let mut counter = 0;
         let title = entry.title.clone();
+        let extension = entry.extension.clone().filter(|ext| !ext.is_empty());
         let nonce = nonce.as_ref().map(|n| n.as_slice());
 
         loop {
@@ -445,11 +487,19 @@ impl Handler {
 
             let result = match entry.expires {
                 None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id.to_i64(), entry.uid, data, entry.burn_after_reading, nonce, title],
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, created_at, seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), (SELECT COALESCE(MAX(seq), 0) + 1 FROM entries))",
+                    params![
+                        id.to_i64(),
+                        entry.uid,
+                        data,
+                        entry.burn_after_reading,
+                        nonce,
+                        title,
+                        extension,
+                    ],
                 ),
                 Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, created_at, seq) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, datetime('now'), (SELECT COALESCE(MAX(seq), 0) + 1 FROM entries))",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -458,6 +508,7 @@ impl Handler {
                         nonce,
                         format!("{expires} seconds"),
                         title,
+                        extension,
                     ],
                 ),
             };
@@ -593,19 +644,60 @@ impl Handler {
     fn list(&self) -> Result<Vec<ListEntry>, Error> {
         let entries = self
             .conn
-            .prepare("SELECT id, title, nonce, expires, expires < datetime('now') FROM entries")?
+            .prepare("SELECT id, title, extension, created_at, nonce, burn_after_reading, expires, expires < datetime('now') FROM entries")?
             .query_map([], |row| {
                 Ok(ListEntry {
                     id: Id::from(row.get::<_, i64>(0)?),
                     title: row.get(1)?,
-                    is_encrypted: row.get::<_, Option<Vec<u8>>>(2)?.is_some(),
-                    expiration: row.get(3)?,
-                    is_expired: row.get::<_, Option<bool>>(4)?.unwrap_or_default(),
+                    extension: row.get(2)?,
+                    created_at: row.get(3)?,
+                    is_encrypted: row.get::<_, Option<Vec<u8>>>(4)?.is_some(),
+                    burn_after_reading: row.get::<_, Option<bool>>(5)?.unwrap_or_default(),
+                    expiration: row.get(6)?,
+                    is_expired: row.get::<_, Option<bool>>(7)?.unwrap_or_default(),
                 })
             })?
             .collect::<Result<_, _>>()?;
 
         Ok(entries)
+    }
+
+    fn list_paginated(&self, page: usize, per_page: usize) -> Result<ListPage, Error> {
+        let total_i64: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE expires IS NULL OR expires >= datetime('now')",
+            [],
+            |row| row.get(0),
+        )?;
+        let total = usize::try_from(total_i64).unwrap_or(0);
+
+        let offset = page.saturating_sub(1).saturating_mul(per_page);
+        let limit_i64 = i64::try_from(per_page).unwrap_or(i64::MAX);
+        let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
+
+        let entries = self
+            .conn
+            .prepare(
+                "SELECT id, title, extension, created_at, nonce, burn_after_reading, expires
+                 FROM entries
+                 WHERE expires IS NULL OR expires >= datetime('now')
+                 ORDER BY created_at DESC, seq DESC
+                 LIMIT ?1 OFFSET ?2",
+            )?
+            .query_map(params![limit_i64, offset_i64], |row| {
+                Ok(ListEntry {
+                    id: Id::from(row.get::<_, i64>(0)?),
+                    title: row.get(1)?,
+                    extension: row.get(2)?,
+                    created_at: row.get(3)?,
+                    is_encrypted: row.get::<_, Option<Vec<u8>>>(4)?.is_some(),
+                    burn_after_reading: row.get::<_, Option<bool>>(5)?.unwrap_or_default(),
+                    expiration: row.get(6)?,
+                    is_expired: false,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(ListPage { entries, total })
     }
 
     fn purge(&self) -> Result<Vec<Id>, Error> {
@@ -748,6 +840,20 @@ impl Database {
         let (result, command_result) = oneshot::channel();
         self.sender
             .send(Command::List { result })
+            .await
+            .map_err(|_| Error::SendError)?;
+        command_result.await?
+    }
+
+    /// List active entries in reverse chronological order with pagination (1-based `page`).
+    pub async fn list_paginated(&self, page: usize, per_page: usize) -> Result<ListPage, Error> {
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::ListPaginated {
+                page,
+                per_page,
+                result,
+            })
             .await
             .map_err(|_| Error::SendError)?;
         command_result.await?
@@ -1034,6 +1140,41 @@ mod tests {
             .await?;
         assert!(matches!(entry, read::Entry::Encrypted(_)));
         assert!(entry.unwrap_inner().metadata.must_be_deleted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_paginated_chronological() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        let mut inserted_ids = Vec::new();
+        for i in 1..=25 {
+            let entry = write::Entry {
+                text: format!("content {i}"),
+                title: Some(format!("Title {i}")),
+                extension: Some("rs".to_string()),
+                ..Default::default()
+            };
+            let (id, _) = db.insert(entry).await?;
+            inserted_ids.push(id);
+        }
+
+        let page1 = db.list_paginated(1, 20).await?;
+        assert_eq!(page1.total, 25);
+        assert_eq!(page1.entries.len(), 20);
+        // Newest first (entry 25 down to 6)
+        assert_eq!(page1.entries[0].id, inserted_ids[24]);
+        assert_eq!(page1.entries[0].title.as_deref(), Some("Title 25"));
+        assert_eq!(page1.entries[0].extension.as_deref(), Some("rs"));
+        assert!(page1.entries[0].created_at.is_some());
+        assert_eq!(page1.entries[19].id, inserted_ids[5]);
+
+        let page2 = db.list_paginated(2, 20).await?;
+        assert_eq!(page2.total, 25);
+        assert_eq!(page2.entries.len(), 5);
+        assert_eq!(page2.entries[0].id, inserted_ids[4]);
+        assert_eq!(page2.entries[4].id, inserted_ids[0]);
 
         Ok(())
     }

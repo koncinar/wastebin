@@ -76,6 +76,65 @@
             </div>
           </div>
         </div>
+        <section class="pastes-section" aria-label="{{ lang.t("index.pastes.title") }}">
+          <div class="pastes-header">
+            <div class="pastes-title">
+              <span>{{ lang.t("index.pastes.title") }}</span>
+              <span class="pastes-count">{{ total_entries }}</span>
+            </div>
+            {% if total_pages > 1 %}
+            <nav class="pagination" aria-label="Pagination">
+              {% if current_page > 1 %}
+                <a href="/?page={{ current_page - 1 }}" class="page-btn">{{ lang.t("index.pastes.prev") }}</a>
+              {% else %}
+                <span class="page-btn disabled">{{ lang.t("index.pastes.prev") }}</span>
+              {% endif %}
+              <span class="page-info">{{ lang.t("index.pastes.page") }} {{ current_page }} / {{ total_pages }}</span>
+              {% if current_page < total_pages %}
+                <a href="/?page={{ current_page + 1 }}" class="page-btn">{{ lang.t("index.pastes.next") }}</a>
+              {% else %}
+                <span class="page-btn disabled">{{ lang.t("index.pastes.next") }}</span>
+              {% endif %}
+            </nav>
+            {% endif %}
+          </div>
+          {% if entries.is_empty() %}
+            <div class="pastes-empty">{{ lang.t("index.pastes.empty") }}</div>
+          {% else %}
+            <div class="pastes-list">
+              {% for entry in entries %}
+                <a href="/{{ entry.url_path() }}" class="paste-row">
+                  <div class="paste-row-main">
+                    {% if let Some(title) = entry.title %}
+                      <span class="paste-row-title">{{ title }}</span>
+                      <span class="paste-row-id">{{ entry.url_path() }}</span>
+                    {% else %}
+                      <span class="paste-row-title">{{ entry.url_path() }}</span>
+                    {% endif %}
+                    {% if entry.is_encrypted %}
+                      <span class="paste-badge" title="{{ lang.t("index.toggle.encrypt") }}">
+                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                      </span>
+                    {% endif %}
+                    {% if entry.burn_after_reading %}
+                      <span class="paste-badge paste-badge-warn" title="{{ lang.t("index.toggle.burn") }}">
+                        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
+                      </span>
+                    {% endif %}
+                  </div>
+                  <div class="paste-row-meta">
+                    {% if let Some(ext) = entry.extension %}
+                      <span class="paste-ext">{{ ext }}</span>
+                    {% endif %}
+                    {% if let Some(created_at) = entry.created_at %}
+                      <span class="paste-date">{{ created_at }}</span>
+                    {% endif %}
+                  </div>
+                </a>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </section>
       </main>
 
       <aside class="panel">
